@@ -32,6 +32,7 @@ import { trackRemoteServerDisplayName } from '../connection/jupyterServerProvide
 @injectable()
 export class RemoteKernelFinderController implements IRemoteKernelFinderController, IExtensionSyncActivationService {
     private serverFinderMapping: Map<string, RemoteKernelFinder> = new Map<string, RemoteKernelFinder>();
+    private readonly serversBeingActivated = new Set<string>();
 
     constructor(
         @inject(IJupyterServerUriStorage) private readonly serverUriStorage: IJupyterServerUriStorage,
@@ -169,7 +170,7 @@ export class RemoteKernelFinderController implements IRemoteKernelFinderControll
     @swallowExceptions('Failed to create a Remote Kernel Finder')
     private async validateAndCreateFinder(serverUri: IJupyterServerUriEntry) {
         const serverId = generateIdFromRemoteProvider(serverUri.provider);
-        if (this.serverFinderMapping.has(serverId)) {
+        if (this.serverFinderMapping.has(serverId) || this.serversBeingActivated.has(serverId)) {
             return;
         }
         const token = new CancellationTokenSource();
@@ -229,6 +230,33 @@ export class RemoteKernelFinderController implements IRemoteKernelFinderControll
             finder.activate().then(noop, noop);
         }
         return this.serverFinderMapping.get(serverId)!;
+    }
+    public async activateJupyterServer(collection: JupyterServerCollection, serverId: string): Promise<void> {
+        const tokenSource = new CancellationTokenSource();
+        try {
+            const servers = await Promise.resolve(collection.serverProvider.provideJupyterServers(tokenSource.token));
+            const server = servers?.find((item) => item.id === serverId);
+            if (!server) {
+                throw new Error(`Jupyter Server '${serverId}' was not found in collection '${collection.id}'.`);
+            }
+
+            const serverProviderHandle: JupyterServerProviderHandle = {
+                extensionId: collection.extensionId,
+                id: collection.id,
+                handle: server.id
+            };
+            const finderId = generateIdFromRemoteProvider(serverProviderHandle);
+            this.serversBeingActivated.add(finderId);
+            try {
+                trackRemoteServerDisplayName(serverProviderHandle, server.label);
+                await this.serverUriStorage.add(serverProviderHandle);
+                this.getOrCreateRemoteKernelFinder(serverProviderHandle, server.label);
+            } finally {
+                this.serversBeingActivated.delete(finderId);
+            }
+        } finally {
+            tokenSource.dispose();
+        }
     }
     createRemoteKernelFinder(serverProviderHandle: JupyterServerProviderHandle, displayName: string) {
         this.getOrCreateRemoteKernelFinder(serverProviderHandle, displayName);

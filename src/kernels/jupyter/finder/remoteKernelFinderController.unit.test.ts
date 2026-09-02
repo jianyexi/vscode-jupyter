@@ -5,8 +5,9 @@
 
 import * as sinon from 'sinon';
 import * as fakeTimers from '@sinonjs/fake-timers';
-import { assert } from 'chai';
-import { anything, instance, mock, when } from 'ts-mockito';
+import { assert, use } from 'chai';
+import chaiAsPromised from 'chai-as-promised';
+import { anything, deepEqual, instance, mock, verify, when } from 'ts-mockito';
 import { Disposable, EventEmitter, Uri } from 'vscode';
 import { noop } from '../../../test/core';
 import { IJupyterConnection, IKernelProvider } from '../../types';
@@ -15,6 +16,7 @@ import {
     IJupyterServerProviderRegistry,
     IJupyterServerUriEntry,
     IJupyterServerUriStorage,
+    IRemoteKernelFinder,
     JupyterServerProviderHandle
 } from '../types';
 import { KernelFinder } from '../../kernelFinder';
@@ -28,6 +30,8 @@ import { RemoteKernelFinderController } from './remoteKernelFinderController';
 import { JupyterServerCollection, JupyterServerProvider } from '../../../api';
 import { UserJupyterServerPickerProviderId } from '../../../platform/constants';
 import { JVSC_EXTENSION_ID_FOR_TESTS } from '../../../test/constants';
+
+use(chaiAsPromised);
 
 suite(`Remote Kernel Finder Controller`, () => {
     let disposables: Disposable[] = [];
@@ -65,6 +69,7 @@ suite(`Remote Kernel Finder Controller`, () => {
     let kernelFinderController: RemoteKernelFinderController;
     let disposableStore: DisposableStore;
     let clock: fakeTimers.InstalledClock;
+    let serverAdded: EventEmitter<IJupyterServerUriEntry>;
     setup(() => {
         clock = fakeTimers.install();
         disposableStore = new DisposableStore();
@@ -72,10 +77,9 @@ suite(`Remote Kernel Finder Controller`, () => {
         disposableStore.add(new Disposable(() => clock.uninstall()));
 
         serverUriStorage = mock<IJupyterServerUriStorage>();
+        serverAdded = disposableStore.add(new EventEmitter<IJupyterServerUriEntry>());
         when(serverUriStorage.all).thenReturn([]);
-        when(serverUriStorage.onDidAdd).thenReturn(
-            disposableStore.add(new EventEmitter<IJupyterServerUriEntry>()).event
-        );
+        when(serverUriStorage.onDidAdd).thenReturn(serverAdded.event);
         when(serverUriStorage.onDidChange).thenReturn(disposableStore.add(new EventEmitter<void>()).event);
         when(serverUriStorage.onDidLoad).thenReturn(disposableStore.add(new EventEmitter<void>()).event);
         when(serverUriStorage.onDidRemove).thenReturn(
@@ -139,5 +143,112 @@ suite(`Remote Kernel Finder Controller`, () => {
         await clock.runAllAsync();
 
         assert.isEmpty(displayNameOfKernelProvider, 'Old API should not be used for user provided kernels');
+    });
+    test('Provider can initialize one of its servers', async () => {
+        const collection = mock<JupyterServerCollection>();
+        const serverProvider = mock<JupyterServerProvider>();
+        const finder = mock<IRemoteKernelFinder>();
+        const server = { id: 'server-1', label: 'Server One' };
+        const providerHandle: JupyterServerProviderHandle = {
+            extensionId: 'publisher.extension',
+            id: 'collection-1',
+            handle: server.id
+        };
+        when(collection.extensionId).thenReturn(providerHandle.extensionId);
+        when(collection.id).thenReturn(providerHandle.id);
+        when(collection.serverProvider).thenReturn(instance(serverProvider));
+        when(serverProvider.provideJupyterServers(anything())).thenReturn(Promise.resolve([server]));
+        when(serverUriStorage.add(deepEqual(providerHandle))).thenResolve();
+        const getFinder = sinon.stub(kernelFinderController, 'getOrCreateRemoteKernelFinder').returns(instance(finder));
+
+        await kernelFinderController.activateJupyterServer(instance(collection), server.id);
+
+        verify(serverUriStorage.add(deepEqual(providerHandle))).once();
+        sinon.assert.calledOnceWithExactly(getFinder, providerHandle, server.label);
+        verify(finder.refresh()).never();
+    });
+    test('Provider server initialization rejects an unknown server id', async () => {
+        const collection = mock<JupyterServerCollection>();
+        const serverProvider = mock<JupyterServerProvider>();
+        when(collection.extensionId).thenReturn('publisher.extension');
+        when(collection.id).thenReturn('collection-1');
+        when(collection.serverProvider).thenReturn(instance(serverProvider));
+        when(serverProvider.provideJupyterServers(anything())).thenReturn(
+            Promise.resolve([{ id: 'server-1', label: 'Server One' }])
+        );
+        const getFinder = sinon.stub(kernelFinderController, 'getOrCreateRemoteKernelFinder');
+
+        await assert.isRejected(
+            kernelFinderController.activateJupyterServer(instance(collection), 'missing-server'),
+            "Jupyter Server 'missing-server' was not found in collection 'collection-1'."
+        );
+
+        verify(serverUriStorage.add(anything())).never();
+        sinon.assert.notCalled(getFinder);
+    });
+    test('Provider server initialization propagates provider failures', async () => {
+        const collection = mock<JupyterServerCollection>();
+        const serverProvider = mock<JupyterServerProvider>();
+        when(collection.serverProvider).thenReturn(instance(serverProvider));
+        when(serverProvider.provideJupyterServers(anything())).thenReject(new Error('Provider failed'));
+        const getFinder = sinon.stub(kernelFinderController, 'getOrCreateRemoteKernelFinder');
+
+        await assert.isRejected(
+            kernelFinderController.activateJupyterServer(instance(collection), 'server-1'),
+            'Provider failed'
+        );
+
+        verify(serverUriStorage.add(anything())).never();
+        sinon.assert.notCalled(getFinder);
+    });
+    test('Provider server initialization propagates storage failures', async () => {
+        const collection = mock<JupyterServerCollection>();
+        const serverProvider = mock<JupyterServerProvider>();
+        const server = { id: 'server-1', label: 'Server One' };
+        const providerHandle: JupyterServerProviderHandle = {
+            extensionId: 'publisher.extension',
+            id: 'collection-1',
+            handle: server.id
+        };
+        when(collection.extensionId).thenReturn(providerHandle.extensionId);
+        when(collection.id).thenReturn(providerHandle.id);
+        when(collection.serverProvider).thenReturn(instance(serverProvider));
+        when(serverProvider.provideJupyterServers(anything())).thenReturn(Promise.resolve([server]));
+        when(serverUriStorage.add(deepEqual(providerHandle))).thenReject(new Error('Storage failed'));
+        const getFinder = sinon.stub(kernelFinderController, 'getOrCreateRemoteKernelFinder');
+
+        await assert.isRejected(
+            kernelFinderController.activateJupyterServer(instance(collection), server.id),
+            'Storage failed'
+        );
+
+        sinon.assert.notCalled(getFinder);
+    });
+    test('Provider server initialization does not enumerate the provider again through storage events', async () => {
+        const collection = mock<JupyterServerCollection>();
+        const serverProvider = mock<JupyterServerProvider>();
+        const finder = mock<IRemoteKernelFinder>();
+        const server = { id: 'server-1', label: 'Server One' };
+        const providerHandle: JupyterServerProviderHandle = {
+            extensionId: 'publisher.extension',
+            id: 'collection-1',
+            handle: server.id
+        };
+        when(collection.extensionId).thenReturn(providerHandle.extensionId);
+        when(collection.id).thenReturn(providerHandle.id);
+        when(collection.serverProvider).thenReturn(instance(serverProvider));
+        when(serverProvider.provideJupyterServers(anything())).thenReturn(Promise.resolve([server]));
+        when(serverUriStorage.add(deepEqual(providerHandle))).thenCall(() => {
+            serverAdded.fire({ provider: providerHandle, time: Date.now(), displayName: '' });
+            return Promise.resolve();
+        });
+        const getFinder = sinon.stub(kernelFinderController, 'getOrCreateRemoteKernelFinder').returns(instance(finder));
+        kernelFinderController.activate();
+        when(jupyterServerProviderRegistry.jupyterCollections).thenReturn([instance(collection)]);
+
+        await kernelFinderController.activateJupyterServer(instance(collection), server.id);
+
+        verify(serverProvider.provideJupyterServers(anything())).once();
+        sinon.assert.calledOnceWithExactly(getFinder, providerHandle, server.label);
     });
 });

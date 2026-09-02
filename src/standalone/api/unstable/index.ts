@@ -19,6 +19,8 @@ import { isWeb, noop } from '../../../platform/common/utils/misc';
 import { EnvironmentPath } from '@vscode/python-extension';
 import { createJupyterServerCollection } from '../servers';
 import { IExportedKernelServiceFactory } from './types';
+import { IJupyterServerProviderRegistry } from '../../../kernels/jupyter/types';
+import { IRemoteKernelFinderController } from '../../../kernels/jupyter/finder/types';
 
 function waitForNotebookControllersCreationForServer(
     serverId: { id: string; handle: string },
@@ -114,6 +116,30 @@ export async function addRemoteJupyterServer(providerId: string, handle: string,
     );
     await selector.addJupyterServer({ id: providerId, handle, extensionId });
     await controllerCreatedPromise;
+}
+
+export async function activateJupyterServer(
+    collectionId: string,
+    serverId: string,
+    serviceContainer: IServiceContainer
+): Promise<void> {
+    const extensions = serviceContainer.get<IExtensions>(IExtensions);
+    const extensionId = extensions.determineExtensionFromCallStack().extensionId;
+    sendTelemetryEvent(Telemetry.JupyterApiUsage, undefined, {
+        clientExtId: extensionId,
+        pemUsed: 'activateJupyterServer'
+    });
+
+    const registry = serviceContainer.get<IJupyterServerProviderRegistry>(IJupyterServerProviderRegistry);
+    const collection = registry.jupyterCollections.find(
+        (item) => item.extensionId === extensionId && item.id === collectionId
+    );
+    if (!collection) {
+        throw new Error(`Jupyter Server Collection '${collectionId}' was not found for extension '${extensionId}'.`);
+    }
+
+    const finderController = serviceContainer.get<IRemoteKernelFinderController>(IRemoteKernelFinderController);
+    await finderController.activateJupyterServer(collection, serverId);
 }
 
 export async function openNotebook(

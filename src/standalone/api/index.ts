@@ -13,6 +13,7 @@ import { createJupyterServerCollection } from './servers';
 import { registerPythonApi } from './pythonExtension';
 import {
     addRemoteJupyterServer,
+    activateJupyterServer,
     getKernelService,
     getReady,
     openNotebook,
@@ -45,6 +46,8 @@ export function buildApi(
         getKernelService: () => getKernelService(serviceContainer),
         addRemoteJupyterServer: (providerId: string, handle: string) =>
             addRemoteJupyterServer(providerId, handle, serviceContainer),
+        activateJupyterServer: (collectionId: string, serverId: string) =>
+            activateJupyterServer(collectionId, serverId, serviceContainer),
         openNotebook: async (uri: Uri, kernelOrPythonEnvId: string | EnvironmentPath) =>
             openNotebook(uri, kernelOrPythonEnvId, serviceContainer),
         createJupyterServerCollection: (id: string, label: string, serverProvider: JupyterServerProvider) => {
